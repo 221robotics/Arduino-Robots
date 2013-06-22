@@ -1,0 +1,258 @@
+//221 Robotic Systems, www.221robotics.com
+//6.22.2013
+//Anthony Lapp
+
+#include <PID_v1.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Ethernet.h>
+#include <EEPROM.h>
+#include <Servo.h>
+#include <RobotOpen.h>
+
+/* I/O Setup */
+//IPAddress ip(192,168,1,110);  //change ip address here if needed
+
+ROJoystick usb1(1);
+
+ROPWM leftDrive(0); //left wheel drive motor
+ROPWM rightDrive(1); //right wheel drive motor
+ROPWM leftWheel_steer(2);  //left wheel steering channel 2
+ROPWM rightWheel_steer(3);  //right wheel steering channel 3
+
+/* Global Variables */
+int leftSteer_APS = 0;  //Set channel 0 for analog input and name it
+int rightSteer_APS = 1;  //Set channel 1 for analog input and name it
+
+int leftAPS = 512;
+int rightAPS = 512;
+int last_leftAPS = 512;
+int last_rightAPS = 512;
+int leftAPSTurns = 0;
+int rightAPSTurns = 0;
+int raw_leftError;
+int raw_rightError;
+int turning;
+int leftDrivePwr;
+int rightDrivePwr;
+int joystickLeft = 127;
+int joystickRight = 127;
+int leftError = 0;
+int rightError = 0;
+int leftsteeringSetPoint = 90;
+int rightsteeringSetPoint = 90;
+
+int throttleMin;
+int throttleMax;
+
+/* Parameter Setup */
+ROBoolParameter joystick_enable("Joystick Enable", 5);
+ROBoolParameter brake_enable("Brake Enable", 12);
+
+ROFloatParameter Kp("Kp", 0);
+ROFloatParameter Ki("Ki", 1);
+ROFloatParameter Kd("Kd", 2);
+
+//ROFloatParameter Wheel1("Wheel 1 RPM Setpoint", 3);
+//ROFloatParameter Wheel2("Wheel 2 RPM Setpoint", 4);
+
+ROFloatParameter leftSteerPGain("Front Steer P Gain", 6); //Front proportional gain
+ROFloatParameter rightSteerPGain("Rear Steer P Gain", 7); //Rear proportional gain
+
+//ROFloatParameter leftWheelSteer_setPoint("Left Wheel Steer Angle", 8); //180 full CW, 0 full CCW
+//ROFloatParameter rightWheelSteer_setPoint("Right Wheel Steer Angle", 9); 
+
+ROFloatParameter TURNING_CUTOFF("Steering Deadband", 10); //smaller for more accurate wheel tracking
+
+ROEncoder leftDrive_encoder(0);
+ROEncoder rightDrive_encoder(1);
+
+//long wheel1_rpm = 0;
+//long wheel2_rpm = 0;
+
+double leftDelta_ticks = 0, leftTicks_last = 0;
+double rightDelta_ticks = 0, rightTicks_last = 0;
+
+double leftDrive_setpoint = 0, rightDrive_setpoint = 0;
+double leftDrive_output = 0, rightDrive_output = 0;
+
+PID leftDrive_PID(&leftDelta_ticks, &leftDrive_output, &leftDrive_setpoint, (double)Kp.get(), (double)Ki.get(), (double)Kd.get(), DIRECT);
+PID rightDrive_PID(&rightDelta_ticks, &rightDrive_output, &rightDrive_setpoint, (double)Kp.get(), (double)Ki.get(), (double)Kd.get(), DIRECT);
+
+void setup() {
+  
+  /* Initiate comms */
+  //RobotOpen.setIP(ip); //Set IP address if needed
+  RobotOpen.begin(&enabled, &disabled, &timedtasks); //RobotOpen loops, don't change
+  
+  leftDrive_PID.SetOutputLimits(-127, 127);
+  rightDrive_PID.SetOutputLimits(-127, 127);
+
+  leftDrive_PID.SetSampleTime(10);
+  rightDrive_PID.SetSampleTime(10);
+
+  leftDrive_PID.SetMode(AUTOMATIC);
+  rightDrive_PID.SetMode(AUTOMATIC);
+  
+}
+
+/* This is your primary robot loop - all of your code
+ * should live here that allows the robot to operate
+ */
+void enabled() {
+
+  leftDrive_PID.Compute();
+  rightDrive_PID.Compute();
+  
+  //Start main steering controls
+  if(joystick_enable.get()) { //modify control scheme for joystick operation
+    
+    leftDrive.write(255-usb1.leftY()); //left wheel responds to leftY axis on gamepad...inverted for gamepad
+    rightDrive.write(255-usb1.rightY()); //right wheel responds to rightY axis on gamepad...inverted for gamepad
+    
+    leftsteeringSetPoint = map(usb1.leftX(), 0, 255, 0, 1010); //left wheel responds to left X axis on gamepad, closed-loop, 90 is straight
+    rightsteeringSetPoint = map(usb1.rightX(), 0, 255, 0, 1010); //right wheel responds to right X axis on gamepad, closed-loop, 90 is straight
+    leftError = (leftAPS + (leftAPSTurns * 1023)) - leftsteeringSetPoint;  //Calculate error for left wheel
+    rightError = (rightAPS + (rightAPSTurns * 1023)) - rightsteeringSetPoint;   //Calculate error fro right wheel
+   
+   }
+   
+  else{
+    
+    leftDrive.write(usb1.leftY()); //left wheel responds to leftY packets from Python script
+    rightDrive.write(usb1.rightY()); //right wheel responds to rightY packets from Python script
+    
+    leftsteeringSetPoint = (map(usb1.leftX(), 0, 180, 0, 1010)); //left wheel responds to left X packets from Python script, closed-loop, 90 is straight
+    rightsteeringSetPoint = map(usb1.rightX(), 0, 180, 0, 1010); //right wheel responds to right X packets from Python script, closed-loop, 90 is straight
+    leftError = (leftAPS + (leftAPSTurns * 1023)) - leftsteeringSetPoint;  //Calculate error for left wheel
+    rightError = (rightAPS + (rightAPSTurns * 1023)) - rightsteeringSetPoint;   //Calculate error fro right wheel
+    
+    if(brake_enable.get()) { //if brake parameter then use encoder to maintain position
+      
+      leftDrive.write(map(leftDrive_output, -127, 127, 0, 255)); // closed-loop braking
+      rightDrive.write(map(rightDrive_output, -127, 127, 0, 255)); // closed-loop braking
+      
+    }
+  }
+  
+  //save steering leftError and rightError for further calculation
+  raw_leftError = leftError;
+  raw_rightError = rightError; 
+  
+  //calculate steering error with P gain              
+  leftError *= leftSteerPGain.get(); //using ROparameter so you can change on the fly
+  rightError *= rightSteerPGain.get(); //using ROparameter so you can change on the fly
+  
+  //Saturate steering error reading if values exceed acceptable values
+  //Numbers larger than those forced would make no sense  
+  if (leftError > 511)
+    leftError = 511;
+  else if (leftError < -512)
+    leftError = -512;
+  if (rightError > 511)
+    rightError = 511;
+  else if (rightError < -512)
+    rightError = -512;
+  
+  // Steering motors
+  // Stop servoing if you're within TURNING_CUTOFF range
+  if (raw_leftError > TURNING_CUTOFF.get() || raw_leftError + TURNING_CUTOFF.get() < 0)
+    leftWheel_steer.write(255-map(leftError, -512, 511, 0, 255));  //map error back to PWM values
+  else
+    leftWheel_steer.write(127);  //when in range stop sending commands
+        
+  if (raw_rightError > TURNING_CUTOFF.get() || raw_rightError + TURNING_CUTOFF.get() < 0)
+    rightWheel_steer.write(255-map(rightError, -512, 511, 0, 255)); //map error back to PWM values
+  else
+    rightWheel_steer.write(127); //when in range stop sending commands
+  
+}
+
+/* This is called while the robot is disabled
+ * PWMs and Solenoids are automatically disabled
+ */
+void disabled() {
+  // safety code
+  leftDrive_PID.SetTunings(Kp.get(), Ki.get(), Kd.get()); //read gains for velocity closed-loop
+  rightDrive_PID.SetTunings(Kp.get(), Ki.get(), Kd.get());
+  
+  leftDrive.write(127); //force drive wheels to 0
+  rightDrive.write(127);
+}
+
+/*
+Code using constant deltaT to calculate rpm base
+on ticks per deltaT
+*/
+byte ticks_per_rotation = 8;
+int interval = 10;
+long delta_check1 = 0, last_check1 = 0;
+long delta_check2 = 0, last_check2 = 0;
+int total_millis1 = 0;
+int total_millis2 = 0;
+
+/* This loop ALWAYS runs - only place code here that can run during a disabled state
+ * This is also a good spot to put driver station publish code
+ */
+ 
+void timedtasks() {  
+  
+  leftAPS = analogRead(leftSteer_APS); //set leftAPS variable to left steering analog sensor value
+  rightAPS = analogRead(rightSteer_APS); //set rightAPS variable to right steering analog sensor value
+  
+  //If sensor values jump suddenly then the sensor has wrapped around zero...increment/decrement counter     
+  if ((leftAPS - last_leftAPS) > 500)
+    leftAPSTurns -= 1;
+  if ((leftAPS - last_leftAPS) < -500)
+    leftAPSTurns += 1;
+      
+  if ((rightAPS - last_rightAPS) > 500)
+    rightAPSTurns -= 1;
+  if ((rightAPS - last_rightAPS) < -500)
+    rightAPSTurns += 1;
+    
+  last_leftAPS = leftAPS;
+  last_rightAPS = rightAPS;
+  
+  delta_check1 = millis() - last_check1; //used for velocity control
+        
+        //right wheel velocity calculations
+        if(delta_check1 >= interval)
+  {
+                long in = (long)leftDrive_encoder.read(); //read encoder value
+		leftDelta_ticks = in - leftTicks_last; //calculate how many ticks have passed
+                                 
+                leftTicks_last = in; //save old value
+                
+	}
+
+  delta_check2 = millis() - last_check2;
+  
+        //left wheel velocity calculations
+	if(delta_check2 >= interval)
+	{
+		long in = (long)rightDrive_encoder.read(); //read encoder value
+		rightDelta_ticks = in - rightTicks_last; //calculate how many ticks have passed
+                
+        	rightTicks_last = in; //save old value
+	}
+  
+  //Publish some values for debugging to the dashboard    
+  RODashboard.publish("leftAPS", map(leftAPS, 0, 1023, 0, 180));
+  RODashboard.publish("rightAPS", map(rightAPS, 0, 1023, 0, 180));
+  RODashboard.publish("leftDelta_ticks", (int)leftDelta_ticks);
+  RODashboard.publish("rightDelta_ticks", (int)rightDelta_ticks);
+  RODashboard.publish("Battery Voltage", ROStatus.batteryReading()); 
+  //RODashboard.publish("Right Output", map(rightDrive_setpoint, -100, 100, 0, 255)); 
+  //RODashboard.publish("Left PID Output", map(leftDrive_output, -127, 127, 0, 255)); 
+  //RODashboard.publish("Right PID Output", map(rightDrive_output, -127, 127, 0, 255)); 
+    
+}
+
+// !!! DO NOT MODIFY !!!
+void loop() {
+  
+  RobotOpen.syncDS();
+  
+}
+
